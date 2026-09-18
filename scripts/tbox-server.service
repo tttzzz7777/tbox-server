@@ -1,0 +1,23 @@
+[Unit]
+Description=tbox-server — HTTP server for remote tbox terminals
+Documentation=file:///root/tbox-server/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tbox-server
+# 启动前先同步公网 IP（公网 IP 是动态的，每次开机可能不一样）
+ExecStartPre=/root/tbox-server/scripts/sync_host.sh
+ExecStart=/root/tbox-server/.venv/bin/python /root/tbox-server/run_server.py
+Restart=on-failure
+RestartSec=5
+# 优雅停止给 15s
+TimeoutStopSec=15
+# 日志进 journald，方便 journalctl -u tbox-server -f 看
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

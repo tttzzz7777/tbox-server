@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""tboxctl — start / stop / inspect the local tbox-server.
+
+Examples
+--------
+    tboxctl start                    # foreground for verification
+    tboxctl start -d                 # detached (background), default port 9999
+    tboxctl stop                     # graceful SIGTERM, then SIGKILL after 8s
+    tboxctl restart
+    tboxctl status                   # PID, uptime, port, health
+    tboxctl logs -n 100              # last 100 lines
+    tboxctl logs -f                  # tail -f style
+    tboxctl admin list               # list known terminals
+    tboxctl admin push TBOX-1 upload --payload file_type=log
+    tboxctl admin show TBOX-1 status # view latest status report
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PID_FILE = ROOT / "data" / "server.pid"
+LOG_FILE = ROOT / "data" / "server.log"
+ENTRYPOINT = ROOT / "run_server.py"
+# Use the same Python interpreter that's running tboxctl — it has aiohttp installed.
+PYTHON = sys.executable
+
+# ----- pretty printing -----
+
+
+def _c(code: str, msg: str) -> str:
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return msg
+    return f"\033[{code}m{msg}\033[0m"
+
+
+def info(msg: str) -> None:
+    print(_c("36", f"==> {msg}"))
+
+
+def ok(msg: str) -> None:
+    print(_c("32", f"✓ {msg}"))
+
+
+def warn(msg: str) -> None:
+    print(_c("33", f"! {msg}"), file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> "None":
+    print(_c("31", f"✗ {msg}"), file=sys.stderr)
+    sys.exit(code)
+
+
+# ----- PID handling -----
+
+
+def _read_pid() -> int | None:
+    if not PID_FILE.exists():
+        return None
+    try:
+        return int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but not ours — be conservative.
+        return True
+    return True
+
+
+def _write_pid(pid: int) -> None:
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PID_FILE.with_suffix(PID_FILE.suffix + ".tmp")
+    tmp.write_text(str(pid))
+    os.replace(tmp, PID_FILE)
+
+
+def _clear_pid() -> None:
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+
+# ----- start -----
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    host = args.host
+    port = args.port
+
+    pid = _read_pid()
+    if pid is not None and _pid_alive(pid):
+        die(f"server already running (pid={pid}); use 'tboxctl stop' first")
+    elif pid is not None:
+        warn(f"stale pid file (pid={pid} not alive); removing")
+        _clear_pid()
+
+    if _port_listening(host, port):
+        die(f"port {port} on {host} is already in use by another process")
+
+    env = os.environ.copy()
+    # TBOX_HOST is NOT set from tboxctl's --host: that's the address tboxctl
+    # itself talks to (admin target). The server's bind address is a separate
+    # concept; the server defaults to 0.0.0.0 (all interfaces) and can be
+    # overridden by setting TBOX_HOST in the user's shell.
+    env["TBOX_PORT"] = str(port)
+    env["TBOX_DATA_DIR"] = str(ROOT / "data")
+
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log_fp = open(LOG_FILE, "ab", buffering=0)
+
+    if not args.detach:
+        info(f"starting server in foreground (Ctrl-C to stop)")
+        proc = subprocess.Popen(
+            [PYTHON, str(ENTRYPOINT)],
+            cwd=ROOT,
+            env=env,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            rc = proc.wait()
+        return rc
+
+    info(f"starting server detached: http://{host}:{port} log={LOG_FILE}")
+    proc = subprocess.Popen(
+        [PYTHON, str(ENTRYPOINT)],
+        cwd=ROOT,
+        env=env,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,  # detach from controlling terminal
+    )
+    _write_pid(proc.pid)
+
+    # Wait for the port to open, then verify health.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            die(f"server exited prematurely (code={proc.returncode}); check {LOG_FILE}")
+        if _port_listening(host, port):
+            break
+        time.sleep(0.1)
+    else:
+        die(f"server did not bind to {host}:{port} within 10s; check {LOG_FILE}")
+
+    ok(f"started pid={proc.pid} http://{host}:{port}")
+    info(f"  log: {LOG_FILE}")
+    info(f"  pid file: {PID_FILE}")
+    return 0
+
+
+# ----- stop -----
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    pid = _read_pid()
+    if pid is None or not _pid_alive(pid):
+        warn("server is not running")
+        _clear_pid()
+        return 0
+
+    info(f"sending SIGTERM to pid={pid}")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _clear_pid()
+        ok("already gone")
+        return 0
+
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        warn(f"pid={pid} did not exit in {args.timeout}s; sending SIGKILL")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    _clear_pid()
+    ok("stopped")
+    return 0
+
+
+# ----- restart -----
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    pid = _read_pid()
+    if pid is not None and _pid_alive(pid):
+        cmd_stop(argparse.Namespace(timeout=8.0))
+    return cmd_start(args)
+
+
+# ----- status -----
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    host = args.host
+    port = args.port
+    pid = _read_pid()
+    alive = pid is not None and _pid_alive(pid)
+    listening = _port_listening(host, port)
+
+    if not alive and not listening:
+        info("status: not running")
+        return 3
+
+    started_at = None
+    uptime_s = None
+    if alive and PID_FILE.exists():
+        started_at = PID_FILE.stat().st_mtime
+        uptime_s = max(0.0, time.time() - started_at)
+
+    print(_c("1;36", "tbox-server status"))
+    print(f"  pid          : {pid}")
+    if uptime_s is not None:
+        print(f"  uptime       : {_format_duration(uptime_s)}")
+    print(f"  bind         : http://{host}:{port}")
+    print(f"  port open    : {listening}")
+    print(f"  log file     : {LOG_FILE}")
+    print(f"  pid file     : {PID_FILE}")
+    print(f"  data dir     : {ROOT / 'data'}")
+
+    # Best-effort health check
+    try:
+        body = _http_get(f"http://{host}:{port}/healthz", timeout=1.0)
+        info(f"  health       : {body.get('status')} (server_version={body.get('server_version')})")
+    except Exception as e:
+        warn(f"  health       : unreachable ({e})")
+        return 4
+
+    try:
+        body = _http_get(f"http://{host}:{port}/admin/terminals", timeout=1.0)
+        terms = body.get("terminals", [])
+        online = sum(1 for t in terms if t.get("online"))
+        info(f"  terminals    : {len(terms)} known, {online} online")
+    except Exception:
+        pass
+    return 0
+
+
+def _format_duration(seconds: float) -> str:
+    s = int(seconds)
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes, secs = divmod(s, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+# ----- logs -----
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    if not LOG_FILE.exists():
+        die(f"log file not found: {LOG_FILE}")
+    if args.follow:
+        # Delegate to tail -F when available.
+        return subprocess.call(["tail", "-n", str(args.lines), "-F", str(LOG_FILE)])
+    # Non-follow: just print the last N lines.
+    try:
+        with open(LOG_FILE, "rb") as fp:
+            data = fp.read()
+    except OSError as e:
+        die(f"failed to read log: {e}")
+    lines = data.splitlines()[-args.lines :]
+    sys.stdout.buffer.write(b"\n".join(lines) + b"\n")
+    return 0
+
+
+# ----- admin subcommands -----
+
+
+def _http_get(url: str, timeout: float = 5.0):
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        die(f"cannot reach {url}: {e.reason}")
+
+
+def _http_post(url: str, body: dict, timeout: float = 5.0):
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        die(f"cannot reach {url}: {e.reason}")
+
+
+def admin_list(args: argparse.Namespace) -> int:
+    base = f"http://{args.host}:{args.port}"
+    body = _http_get(f"{base}/admin/terminals")
+    terms = body.get("terminals", [])
+    if not terms:
+        info("no terminals registered yet")
+        return 0
+    name_w = max(8, *(len(t["terminal_id"]) for t in terms))
+    print(f"{'TERMINAL':<{name_w}}  {'STATE':<6}  {'LAST_SEEN':<10}  {'SERVICE':<14}  PENDING")
+    print("-" * (name_w + 50))
+    for t in terms:
+        state = _c("32", "online") if t["online"] else _c("33", "offline")
+        last_seen = time.strftime("%H:%M:%S", time.localtime(t["last_seen"])) if t["last_seen"] else "-"
+        service = t.get("service") or "-"
+        print(
+            f"{t['terminal_id']:<{name_w}}  {state:<14}  {last_seen:<10}  "
+            f"{service:<14}  {t.get('pending_commands', 0)}"
+        )
+    return 0
+
+
+# -- payload parsing ---------------------------------------------------------
+
+# Old `--payload k=v` parsed everything as strings, but v2's payload schema
+# (e.g. timeout=30 must be a number) needs real types. Support both:
+#   --payload file_type=log                 -> string
+#   --payload timeout=30                    -> int
+#   --payload path=/var/log/x.log           -> string
+#   --payload-json '{"file_type":"log"}'    -> full JSON object override
+# Mixed forms merge: each --payload adds one key, --payload-json adds the
+# whole object (multiple --payload-json is invalid; error out).
+
+
+def _coerce_scalar(v: str):
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def _parse_payload_args(payload_kv: list[str] | None, payload_json: list[str] | None) -> dict:
+    payload: dict = {}
+    for kv in payload_kv or []:
+        if "=" not in kv:
+            die(f"--payload expects key=value, got {kv!r}")
+        k, v = kv.split("=", 1)
+        payload[k] = _coerce_scalar(v)
+    if payload_json:
+        if len(payload_json) > 1:
+            die("--payload-json may only be specified once")
+        try:
+            obj = json.loads(payload_json[0])
+        except json.JSONDecodeError as e:
+            die(f"--payload-json is not valid JSON: {e}")
+        if not isinstance(obj, dict):
+            die("--payload-json must decode to a JSON object")
+        payload.update(obj)
+    return payload
+
+
+def admin_push(args: argparse.Namespace) -> int:
+    if not args.tid or not args.type:
+        die(
+            "usage: tboxctl admin push <terminal_id> <type> "
+            "[--payload k=v ... | --payload-json '<json>']"
+        )
+    payload = _parse_payload_args(args.payload, args.payload_json)
+    body = {"terminal_id": args.tid, "type": args.type, "payload": payload}
+    res = _http_post(f"http://{args.host}:{args.port}/admin/command", body)
+    ok(f"queued command {res.get('cmd_id')} -> {args.tid} type={args.type}")
+    return 0
+
+
+def admin_reports(args: argparse.Namespace) -> int:
+    base = f"http://{args.host}:{args.port}"
+    body = _http_get(f"{base}/admin/reports?terminal_id=" + urllib.parse.quote(args.tid))
+    reports = body.get("reports", [])
+    if not reports:
+        info(f"no reports for {args.tid}")
+        return 0
+    type_w = max(8, *(len(r["type"]) for r in reports))
+    print(f"{'TYPE':<{type_w}}  LATEST_MTIME                 PATH")
+    print("-" * (type_w + 50))
+    for r in reports:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["latest_mtime"])) if r["latest_mtime"] else "-"
+        print(f"{r['type']:<{type_w}}  {ts:<26}  {r['latest_path']}")
+    return 0
+
+
+def admin_show(args: argparse.Namespace) -> int:
+    base = f"http://{args.host}:{args.port}"
+    qs = "terminal_id=" + urllib.parse.quote(args.tid)
+    rtype = args.type or "status"
+    qs += "&type=" + urllib.parse.quote(rtype)
+    try:
+        body = _http_get(f"{base}/admin/report?{qs}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            warn(f"no {rtype} report for tid={args.tid!r}")
+            return 2
+        raise
+    payload = body.get("payload")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _fmt_bytes(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if f < 1024:
+            return f"{f:6.1f} {unit}"
+        f /= 1024
+    return f"{f:6.1f} PiB"
+
+
+def admin_disk(args: argparse.Namespace) -> int:
+    base = f"http://{args.host}:{args.port}"
+    body = _http_get(f"{base}/admin/disk")
+    info(f"data dir       : {body.get('data_dir')}")
+    info(f"retention      : {body.get('retention_s')}s "
+         f"({body.get('retention_s', 0) / 86400:.1f} days)")
+    info(f"cleanup every  : {body.get('cleanup_interval_s')}s")
+    info(f"total          : {_fmt_bytes(body.get('total_bytes', 0))}")
+    print()
+    cats = body.get("categories", {})
+    if cats:
+        name_w = max(8, *(len(k) for k in cats))
+        print(f"{'CATEGORY':<{name_w}}  SIZE     PATH")
+        print("-" * (name_w + 60))
+        for name, info_ in cats.items():
+            print(f"{name:<{name_w}}  {_fmt_bytes(info_['bytes'])}  {info_['path']}")
+    return 0
+
+
+def admin_cleanup(args: argparse.Namespace) -> int:
+    base = f"http://{args.host}:{args.port}"
+    qs = ""
+    if args.older_than_s is not None:
+        qs = "?older_than_s=" + str(args.older_than_s)
+    body = _http_post(f"{base}/admin/cleanup{qs}", {})
+    ok(
+        f"cleaned: {body.get('uploads_dirs_removed')} upload-dirs, "
+        f"{body.get('reports_files_removed')} status files "
+        f"(freed {_fmt_bytes(body.get('bytes_freed', 0))}, "
+        f"{body.get('skipped_recent')} recent items kept)"
+    )
+    return 0
+
+
+# ----- arg parser -----
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="tboxctl",
+        description="manage the local tbox-server",
+    )
+    p.add_argument("--host", default="159.75.187.190", help="admin host (default: 159.75.187.190)")
+    p.add_argument("--port", type=int, default=9999, help="admin port (default: 9999)")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("start", help="start the server")
+    sp.add_argument("-d", "--detach", action="store_true", help="run in background")
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser("stop", help="stop a running server")
+    sp.add_argument("--timeout", type=float, default=8.0, help="seconds before SIGKILL")
+    sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser("restart", help="restart the server")
+    sp.add_argument("-d", "--detach", action="store_true", help="run in background")
+    sp.set_defaults(func=cmd_restart)
+
+    sp = sub.add_parser("status", help="show server status")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("logs", help="show recent log lines")
+    sp.add_argument("-n", "--lines", type=int, default=50, help="number of lines")
+    sp.add_argument("-f", "--follow", action="store_true", help="follow the log")
+    sp.set_defaults(func=cmd_logs)
+
+    admin = sub.add_parser("admin", help="admin API helpers")
+    admin_sub = admin.add_subparsers(dest="admin_cmd", required=True)
+
+    sp = admin_sub.add_parser("list", help="list terminals")
+    sp.set_defaults(func=admin_list)
+
+    sp = admin_sub.add_parser("push", help="push a command to a terminal")
+    sp.add_argument("tid", help="terminal id")
+    sp.add_argument("type", help="command type (upload, exec)")
+    sp.add_argument(
+        "--payload",
+        action="append",
+        help="key=value payload entry; values are coerced (int/float/bool/str). Repeatable.",
+    )
+    sp.add_argument(
+        "--payload-json",
+        action="append",
+        help="full payload as a single JSON object (overrides / merges with --payload)",
+    )
+    sp.set_defaults(func=admin_push)
+
+    sp = admin_sub.add_parser("reports", help="list stored reports for a terminal")
+    sp.add_argument("tid", help="terminal id")
+    sp.set_defaults(func=admin_reports)
+
+    sp = admin_sub.add_parser("show", help="show a terminal's latest report JSON")
+    sp.add_argument("tid", help="terminal id")
+    sp.add_argument("type", nargs="?", default="status", help="report type (default: 'status')")
+    sp.set_defaults(func=admin_show)
+
+    sp = admin_sub.add_parser("disk", help="show disk usage breakdown under data/")
+    sp.set_defaults(func=admin_disk)
+
+    sp = admin_sub.add_parser("cleanup", help="trigger a retention sweep on demand")
+    sp.add_argument(
+        "--older-than-s",
+        type=int,
+        default=None,
+        help="override retention (seconds); default: TBOX_DATA_RETENTION_S",
+    )
+    sp.set_defaults(func=admin_cleanup)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        die("interrupted", code=130)
+    except subprocess.CalledProcessError as e:
+        die(f"command failed: {e}", code=e.returncode)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

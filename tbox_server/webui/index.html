@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tbox-server 控制台</title>
+  <link rel="stylesheet" href="/webui/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▣</span>
+      <h1>tbox-server 控制台</h1>
+    </div>
+    <div class="server-meta">
+      <span class="server-status">
+        <span id="health-dot" class="status-dot unknown"></span>
+        <span id="health-text">…</span>
+      </span>
+      <span class="muted" id="server-version">v0.0.0</span>
+      <span class="auto-refresh">
+        <span class="muted small">更新于</span>
+        <span id="refresh-label" class="small">—</span>
+      </span>
+      <button id="refresh-btn" class="btn">手动刷新</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>终端 <span id="term-count" class="muted">(0)</span></h2>
+      </div>
+      <div id="terminals" class="terminal-list">
+        <p class="empty">暂无终端</p>
+      </div>
+    </aside>
+
+    <section id="detail-panel" class="detail">
+      <div class="empty">
+        <p>← 从左侧选择一个终端</p>
+        <p class="muted small">支持查看状态、下发命令、上传触发、查看历史</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/webui/app.js"></script>
+</body>
+</html>

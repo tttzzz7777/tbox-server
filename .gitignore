@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Runtime data (server state, logs, uploads, terminal reports)
+data/
+*.log
+*.pid
+!data/.gitkeep
+
+# Backups
+*.bak
+tboxctl.bak.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Editor backup files
+*~
+.directory
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Misc
+*.tmp
+*.orig
